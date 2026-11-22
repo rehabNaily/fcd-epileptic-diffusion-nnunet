@@ -1,0 +1,581 @@
+FCD — Prétraitement commun V2.1 (ds004199, 170 sujets)¶
+Version corrigée après le premier contrôle qualité (V2.1 : listing OpenNeuro corrigé, nouvelles tentatives automatiques si Zenodo ne répond pas) :
+
+Données toujours téléchargées depuis OpenNeuro (la copie Kaggle avait des fichiers abîmés : 81 ROI au lieu de 85, FLAIR de sub-00073 illisible), avec vérification fichier par fichier des tailles par rapport au serveur et garde-fou des 85 ROI.
+Correction de biais N4 renforcée (4 niveaux, rééchantillonnage ×2, champ plus souple) contre l'inhomogénéité centre-périphérie vue sur sub-00149.
+Nouveaux indicateurs QC : information mutuelle FLAIR/T1 recalculée après N4 et dans le cerveau (mi_final, insensible au champ de biais), indices d'inhomogénéité résiduelle (inhom_t1, inhom_flair), empreinte MD5 de chaque fichier final.
+Le grand déplacement entre T1 et FLAIR devient une information (le patient a bougé), plus une alerte.
+QC visuel forcé sur les sujets déjà repérés (sub-00149, 00073, 00112, 00167, 00043, 00006) + une colonne montrant le biais résiduel.
+Étape	Outil	Matériel
+0. Téléchargement OpenNeuro + vérification d'intégrité	awscli	CPU
+1. FLAIR LPS 1 mm + ROI ; recalage rigide T1 → FLAIR	SimpleITK	CPU (parallèle)
+2. Extraction du cerveau sur le T1 recalé	HD-BET	GPU
+3. N4 renforcé, z-score dans le cerveau, recadrage, indicateurs QC	SimpleITK / NumPy	CPU (parallèle)
+4. Contrôle qualité chiffré + visuel	—	—
+Réglages Kaggle : Internet activé, accélérateur GPU T4. Aucun dataset n'est nécessaire. Lance-le dans une nouvelle session (dossier /kaggle/working vide). Durée estimée : environ 2 h.
+
+Sortie (final/sub-XXXXX.npz) : flair, t1 (float16, z-score dans le cerveau, 0 hors cerveau), mask, roi (vide pour les témoins), bbox, spacing. Ordre des axes SimpleITK (z, y, x).
+
+# Cell 1 — Environnement
+import os, re, sys, time, json, shutil, subprocess
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'SimpleITK', 'awscli'], check=False)
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import SimpleITK as sitk
+import nibabel as nib
+from scipy import ndimage
+
+WORK = Path('/kaggle/working') if Path('/kaggle/working').exists() else Path('.')
+INPUT = Path('/kaggle/input')
+OUT = WORK / 'ds004199_preproc'
+STAGE1, BET_IN, BET_OUT, FINAL = OUT / 'stage1', OUT / 'bet_in', OUT / 'bet_out', OUT / 'final'
+for d in (STAGE1, BET_IN, BET_OUT, FINAL):
+    d.mkdir(parents=True, exist_ok=True)
+S3 = 's3://openneuro.org/ds004199'
+N_CPU = os.cpu_count() or 2
+N_WORKERS = max(1, min(4, N_CPU))
+SPACING = (1.0, 1.0, 1.0)
+T0 = time.time()
+print('CPU:', N_CPU, '| workers:', N_WORKERS, '| SimpleITK', sitk.Version.VersionString())
+
+def aws(*args):
+    r = subprocess.run([sys.executable, '-m', 'awscli', 's3', *args, '--no-sign-request'], capture_output=True, text=True)
+    if r.returncode != 0:
+        print('ERREUR aws:', r.stderr[-1500:])
+    return r
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 20.2/20.2 MB 48.8 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 570.5/570.5 kB 24.4 MB/s eta 0:00:00
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+sphinx 8.2.3 requires docutils<0.22,>=0.20, but you have docutils 0.19 which is incompatible.
+CPU: 4 | workers: 4 | SimpleITK 2.5.6
+Étape 0 — Téléchargement OpenNeuro et vérification d'intégrité
+# Cell 2 — Téléchargement (toujours depuis OpenNeuro) + comparaison des tailles avec le serveur
+RESET_OUTPUTS = False   # True = effacer ds004199_preproc/ (utile si la session contient d'anciens résultats)
+if RESET_OUTPUTS:
+    shutil.rmtree(OUT, ignore_errors=True)
+    for d in (STAGE1, BET_IN, BET_OUT, FINAL): d.mkdir(parents=True, exist_ok=True)
+
+FULL = WORK / 'ds004199_full'
+aws('cp', f'{S3}/participants.tsv', str(OUT / 'participants.tsv'))
+parts = pd.read_csv(OUT / 'participants.tsv', sep='\t')
+
+listing = aws('ls', f'{S3}/', '--recursive').stdout.splitlines()
+remote = {}
+for line in listing:
+    f = line.split()
+    if len(f) != 4:
+        continue
+    key = f[3]
+    if key.startswith('ds004199/'):          # le listing récursif inclut le préfixe du dataset
+        key = key[len('ds004199/'):]
+    if '/anat/' in key and key.startswith('sub-'):
+        remote[key] = int(f[2])
+print(f'{len(remote)} fichiers anat sur le serveur, {sum(remote.values())/1e9:.2f} Go')
+assert len(remote) > 700, 'Listing OpenNeuro vide ou incomplet : la vérification d intégrité serait sans effet'
+
+def check_integrity():
+    missing, wrong = [], []
+    for key, size in remote.items():
+        p = FULL / key
+        if not p.is_file(): missing.append(key)
+        elif p.stat().st_size != size: wrong.append(key)
+    return missing, wrong
+
+for attempt in range(1, 4):
+    t0 = time.time()
+    aws('sync', f'{S3}/', str(FULL), '--exclude', '*', '--include', 'sub-*/anat/*', '--only-show-errors')
+    missing, wrong = check_integrity()
+    print(f'Tentative {attempt} ({time.time()-t0:.0f}s) : {len(missing)} manquants, {len(wrong)} de taille incorrecte')
+    if not missing and not wrong:
+        break
+    for key in wrong:   # forcer le re-téléchargement des fichiers abîmés
+        (FULL / key).unlink(missing_ok=True)
+assert not missing and not wrong, f'Intégrité non garantie : {missing[:5]} {wrong[:5]}'
+print('Intégrité OK : chaque fichier local a exactement la taille du fichier OpenNeuro.')
+765 fichiers anat sur le serveur, 4.15 Go
+Tentative 1 (21s) : 0 manquants, 0 de taille incorrecte
+Intégrité OK : chaque fichier local a exactement la taille du fichier OpenNeuro.
+# Cell 3 — Inventaire + garde-fous
+def noext(p):
+    s = Path(p).name
+    return s[:-7] if s.endswith('.nii.gz') else (s[:-4] if s.endswith('.nii') else s)
+
+def real_niis(d):
+    d = Path(d)
+    if not d.exists():
+        return []
+    return [p for p in d.rglob('*') if p.is_file() and p.name.endswith(('.nii', '.nii.gz')) and p.stat().st_size > 1000]
+
+rows = []
+for sid in parts['participant_id']:
+    files = real_niis(FULL / sid / 'anat')
+    flairs = [p for p in files if 'flair' in p.name.lower() and 'roi' not in p.name.lower()]
+    t1s = [p for p in files if 't1w' in p.name.lower() and 'roi' not in p.name.lower()]
+    rois = [p for p in files if 'roi' in p.name.lower()]
+    flair = None
+    if rois and flairs:
+        match = [f for f in flairs if noext(f) + '_roi' == noext(rois[0])]
+        flair = (match or flairs)[0]
+    elif flairs:
+        flair = flairs[0]
+    rows.append({'participant_id': sid, 'flair_path': str(flair) if flair else None,
+                 't1_path': str(t1s[0]) if t1s else None, 'roi_path': str(rois[0]) if rois else None,
+                 'n_flair': len(flairs), 'n_t1': len(t1s)})
+inv = pd.DataFrame(rows).merge(parts, on='participant_id', how='left')
+print('Plusieurs FLAIR ou T1 pour un sujet :', inv.loc[(inv.n_flair > 1) | (inv.n_t1 > 1), 'participant_id'].tolist() or 'aucun')
+
+n_roi = int((inv.group.eq('fcd') & inv.roi_path.notna()).sum())
+n_bad_hc = int((inv.group.eq('hc') & inv.roi_path.notna()).sum())
+inv = inv[inv.flair_path.notna() & inv.t1_path.notna()].reset_index(drop=True)
+print(len(inv), 'sujets avec FLAIR + T1 |', inv.group.value_counts().to_dict(), '| patients avec ROI :', n_roi)
+assert len(inv) == 170, f'{len(inv)} sujets complets au lieu de 170'
+assert n_roi == 85, f'Seulement {n_roi} ROI sur 85 : données incomplètes'
+assert n_bad_hc == 0, 'Un témoin possède une ROI : incohérence'
+print('Garde-fous OK')
+Plusieurs FLAIR ou T1 pour un sujet : aucun
+170 sujets avec FLAIR + T1 | {'fcd': 85, 'hc': 85} | patients avec ROI : 85
+Garde-fous OK
+Étape 1 — Grille FLAIR 1 mm + recalage T1 → FLAIR (CPU)
+# Cell 4 — Fonctions de l'étape 1
+def read3d(path, pixel=sitk.sitkFloat32):
+    img = sitk.ReadImage(str(path), pixel)
+    if img.GetDimension() == 4:
+        img = img[:, :, :, 0]
+    return img
+
+def resample_iso(img, spacing=(1.0, 1.0, 1.0), interp=sitk.sitkLinear):
+    sp, sz = np.array(img.GetSpacing()), np.array(img.GetSize())
+    new_sz = [int(round(s * p / n)) for s, p, n in zip(sz, sp, spacing)]
+    return sitk.Resample(img, new_sz, sitk.Transform(), interp, img.GetOrigin(),
+                         spacing, img.GetDirection(), 0.0, img.GetPixelID())
+
+def _stage1(args):
+    sid, flair_p, t1_p, roi_p, out_root, n_threads = args
+    out = Path(out_root) / sid
+    needed = [out / 'flair.nii.gz', out / 't1_reg.nii.gz', out / 'reg.json']
+    if all(p.exists() for p in needed):
+        return sid, True, 'cache'
+    try:
+        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(n_threads)
+        out.mkdir(parents=True, exist_ok=True)
+        info = {}
+        # FLAIR : orientation commune + 1 mm isotrope
+        fl = sitk.DICOMOrient(read3d(flair_p), 'LPS')
+        fl = resample_iso(fl, SPACING, sitk.sitkLinear)
+        # ROI -> grille FLAIR (plus proche voisin), contrôle du volume
+        if isinstance(roi_p, str):
+            roi = read3d(roi_p, sitk.sitkFloat32)
+            roi_vol_orig = float((sitk.GetArrayViewFromImage(roi) > 0).sum() * np.prod(roi.GetSpacing()))
+            roi_r = sitk.Resample(roi, fl, sitk.Transform(), sitk.sitkNearestNeighbor, 0.0, sitk.sitkFloat32)
+            roi_r = sitk.Cast(roi_r > 0, sitk.sitkUInt8)
+            roi_vol_new = float(sitk.GetArrayViewFromImage(roi_r).sum() * np.prod(SPACING))
+            info['roi_ml'] = roi_vol_new / 1000
+            info['roi_volume_ratio'] = roi_vol_new / max(roi_vol_orig, 1e-6)
+            sitk.WriteImage(roi_r, str(out / 'roi.nii.gz'))
+        # Recalage rigide T1 -> FLAIR
+        t1 = read3d(t1_p)
+        init = sitk.CenteredTransformInitializer(fl, t1, sitk.Euler3DTransform(),
+                                                 sitk.CenteredTransformInitializerFilter.GEOMETRY)
+        R = sitk.ImageRegistrationMethod()
+        R.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+        R.SetMetricSamplingStrategy(R.RANDOM)
+        R.SetMetricSamplingPercentage(0.05, 42)
+        R.SetInterpolator(sitk.sitkLinear)
+        R.SetOptimizerAsRegularStepGradientDescent(learningRate=2.0, minStep=1e-4,
+                                                   numberOfIterations=200, relaxationFactor=0.5)
+        R.SetOptimizerScalesFromPhysicalShift()
+        R.SetShrinkFactorsPerLevel([4, 2, 1])
+        R.SetSmoothingSigmasPerLevel([2, 1, 0])
+        R.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+        R.SetInitialTransform(sitk.Euler3DTransform(), inPlace=False)
+        info['mi_avant'] = float(R.MetricEvaluate(fl, t1))      # alignement par en-tête seul
+        R.SetInitialTransform(init, inPlace=False)
+        tx = R.Execute(fl, t1)
+        info['mi_apres'] = float(R.GetMetricValue())
+        c = fl.TransformContinuousIndexToPhysicalPoint([s / 2 for s in fl.GetSize()])
+        info['deplacement_centre_mm'] = float(np.linalg.norm(np.array(tx.TransformPoint(c)) - np.array(c)))
+        t1r = sitk.Resample(t1, fl, tx, sitk.sitkLinear, 0.0, sitk.sitkFloat32)
+        sitk.WriteImage(fl, str(out / 'flair.nii.gz'))
+        sitk.WriteImage(t1r, str(out / 't1_reg.nii.gz'))
+        with open(out / 'reg.json', 'w') as f:
+            json.dump(info, f)
+        return sid, True, None
+    except Exception as e:
+        return sid, False, f'{type(e).__name__}: {e}'
+print('Étape 1 prête')
+Étape 1 prête
+# Cell 5 — Exécution parallèle de l'étape 1
+tasks = [(r.participant_id, r.flair_path, r.t1_path, r.roi_path, str(STAGE1), max(1, N_CPU // N_WORKERS))
+         for r in inv.itertuples()]
+t0 = time.time(); n_ok = n_cache = 0; fails = []
+with ProcessPoolExecutor(max_workers=N_WORKERS) as ex:
+    futs = [ex.submit(_stage1, t) for t in tasks]
+    for i, fu in enumerate(as_completed(futs), 1):
+        sid, ok, msg = fu.result()
+        if ok and msg == 'cache': n_cache += 1
+        elif ok: n_ok += 1
+        else: fails.append((sid, msg)); print('  échec', sid, msg)
+        if i % 20 == 0:
+            print(f'  {i}/{len(tasks)}  ({(time.time()-t0)/60:.1f} min)')
+print(f'Étape 1 : {n_ok} traités, {n_cache} déjà en cache, {len(fails)} échecs, {(time.time()-t0)/60:.1f} min')
+  20/170  (3.8 min)
+  40/170  (7.5 min)
+  60/170  (11.0 min)
+  80/170  (15.7 min)
+  100/170  (20.2 min)
+  120/170  (24.7 min)
+  140/170  (29.0 min)
+  160/170  (33.1 min)
+Étape 1 : 170 traités, 0 déjà en cache, 0 échecs, 35.3 min
+Étape 2 — Extraction du cerveau avec HD-BET (GPU)
+HD-BET est appliqué au T1 recalé (déjà dans la grille FLAIR), donc le masque obtenu sert directement pour le FLAIR et le T1. Un test sur un seul sujet est fait d'abord ; si HD-BET échoue, le message d'erreur s'affiche ici : envoie-le moi.
+
+# Cell 6 — Installation et test de HD-BET sur un sujet
+subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'hd-bet'], check=False)
+HDBET = shutil.which('hd-bet')
+print('hd-bet :', HDBET)
+assert HDBET, "Commande 'hd-bet' introuvable après installation."
+
+BET_OPTS = ['-device', 'cuda', '--disable_tta']   # options validées pour cette version de HD-BET
+
+def run_hdbet(inp, outp, tries=6, wait=60):
+    # Au premier appel, HD-BET télécharge ses poids depuis Zenodo, parfois indisponible (erreur 504) :
+    # on réessaie avec une attente croissante (1, 2, 4, 8, 16 min).
+    for k in range(1, tries + 1):
+        r = subprocess.run([HDBET, '-i', str(inp), '-o', str(outp)] + BET_OPTS, capture_output=True, text=True)
+        produced = list(Path(outp).glob('*.nii.gz')) if Path(outp).is_dir() else []
+        if r.returncode == 0 and produced:
+            return BET_OPTS
+        err = (r.stderr or r.stdout)[-400:]
+        print(f'  tentative {k}/{tries} échouée :', err.strip().splitlines()[-1] if err.strip() else '?')
+        if k < tries:
+            print(f'  nouvelle tentative dans {wait//60} min...'); time.sleep(wait); wait *= 2
+    raise RuntimeError('HD-BET a échoué après plusieurs tentatives (voir le message ci-dessus).')
+
+test_sid = inv.participant_id.iloc[0]
+tin, tout = OUT / 'bet_test_in', OUT / 'bet_test_out'
+for d in (tin, tout):
+    shutil.rmtree(d, ignore_errors=True); d.mkdir()
+shutil.copy(STAGE1 / test_sid / 't1_reg.nii.gz', tin / f'{test_sid}.nii.gz')
+t0 = time.time()
+BET_OPTS = run_hdbet(tin, tout)
+print(f'HD-BET OK avec options {BET_OPTS} en {time.time()-t0:.0f}s ; fichiers produits :', [p.name for p in tout.iterdir()])
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 63.1/63.1 kB 2.7 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 291.1/291.1 kB 7.3 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 106.8/106.8 kB 5.8 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 79.5/79.5 kB 2.2 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 53.6/53.6 kB 2.6 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 28.4/28.4 MB 71.1 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.5/2.5 MB 63.5 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.9/4.9 MB 101.7 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 96.4/96.4 kB 4.9 MB/s eta 0:00:00
+hd-bet : /usr/local/bin/hd-bet
+HD-BET OK avec options ['-device', 'cuda', '--disable_tta'] en 1001s ; fichiers produits : ['sub-00058.nii.gz']
+# Cell 7 — HD-BET sur tous les sujets + masque cerveau propre
+todo = [sid for sid in inv.participant_id
+        if (STAGE1 / sid / 't1_reg.nii.gz').exists() and not (STAGE1 / sid / 'brainmask.nii.gz').exists()]
+print(len(todo), 'sujets à traiter par HD-BET')
+CHUNK = 20   # par paquets : un arrêt de session ne perd qu'un paquet
+for i in range(0, len(todo), CHUNK):
+    chunk = todo[i:i + CHUNK]
+    shutil.rmtree(BET_IN, ignore_errors=True); BET_IN.mkdir()
+    shutil.rmtree(BET_OUT, ignore_errors=True); BET_OUT.mkdir()
+    for sid in chunk:
+        os.symlink(STAGE1 / sid / 't1_reg.nii.gz', BET_IN / f'{sid}.nii.gz')
+    t0 = time.time()
+    run_hdbet(BET_IN, BET_OUT)
+    for sid in chunk:
+        outs = sorted(BET_OUT.glob(f'{sid}*.nii.gz'))
+        if not outs:
+            print('  aucune sortie pour', sid); continue
+        ref = nib.load(str(STAGE1 / sid / 'flair.nii.gz'))
+        m = np.asarray(nib.load(str(outs[0])).dataobj) != 0      # masque ou image extraite : non-nul = cerveau
+        assert m.shape == ref.shape, f'{sid}: forme {m.shape} != {ref.shape}'
+        lab, n = ndimage.label(m)
+        if n > 1:
+            m = lab == (np.argmax(np.bincount(lab.ravel())[1:]) + 1)   # plus grande composante
+        m = ndimage.binary_fill_holes(m)
+        nib.save(nib.Nifti1Image(m.astype(np.uint8), ref.affine), str(STAGE1 / sid / 'brainmask.nii.gz'))
+    print(f'  paquet {i//CHUNK + 1} : {len(chunk)} sujets en {time.time()-t0:.0f}s')
+shutil.rmtree(BET_IN, ignore_errors=True); shutil.rmtree(BET_OUT, ignore_errors=True)
+shutil.rmtree(OUT / 'bet_test_in', ignore_errors=True); shutil.rmtree(OUT / 'bet_test_out', ignore_errors=True)
+print('Masques disponibles :', sum((STAGE1 / s / 'brainmask.nii.gz').exists() for s in inv.participant_id))
+170 sujets à traiter par HD-BET
+  paquet 1 : 20 sujets en 99s
+  paquet 2 : 20 sujets en 101s
+  paquet 3 : 20 sujets en 101s
+  paquet 4 : 20 sujets en 101s
+  paquet 5 : 20 sujets en 99s
+  paquet 6 : 20 sujets en 101s
+  paquet 7 : 20 sujets en 104s
+  paquet 8 : 20 sujets en 103s
+  paquet 9 : 10 sujets en 70s
+Masques disponibles : 170
+Étape 3 — Correction de biais N4, normalisation, recadrage (CPU)
+# Cell 8 — Fonctions de l'étape 3 (N4 renforcé + indicateurs QC)
+import hashlib
+
+def n4_correct(img, mask, shrink=2):
+    arr = np.maximum(sitk.GetArrayFromImage(img), 0) + 1.0        # N4 exige des valeurs positives
+    pos = sitk.GetImageFromArray(arr.astype(np.float32)); pos.CopyInformation(img)
+    f = sitk.N4BiasFieldCorrectionImageFilter()
+    f.SetMaximumNumberOfIterations([100, 100, 100, 50])           # 4 niveaux
+    f.SetConvergenceThreshold(1e-6)
+    f.SetNumberOfControlPoints([6, 6, 6])                         # champ un peu plus souple
+    f.Execute(sitk.Shrink(pos, [shrink] * 3), sitk.Shrink(mask, [shrink] * 3))
+    log_bias = f.GetLogBiasFieldAsImage(pos)
+    return sitk.GetArrayFromImage(pos / sitk.Exp(log_bias)).astype(np.float32)
+
+def znorm(arr, m, lo=0.5, hi=99.5):
+    a, b = np.percentile(arr[m], [lo, hi])
+    x = np.clip(arr, a, b)
+    x = (x - x[m].mean()) / (x[m].std() + 1e-6)
+    x[~m] = 0
+    return x.astype(np.float32)
+
+def smooth_in_mask(x, m, sigma=10):
+    w = ndimage.gaussian_filter(m.astype(np.float32), sigma)
+    return ndimage.gaussian_filter(x * m, sigma) / np.maximum(w, 1e-3)
+
+def inhomogeneity(x, m):
+    # écart-type de l'image très lissée dans le cerveau (érodé) : élevé = dégradé d'intensité résiduel
+    me = ndimage.binary_erosion(m, iterations=5)
+    return float(smooth_in_mask(x, m)[me].std()) if me.any() else np.nan
+
+def mi_in_mask(a, b, m):
+    # information mutuelle (Mattes) FLAIR/T1 dans le cerveau, sur images corrigées : contrôle d'alignement
+    A, B = sitk.GetImageFromArray(a.astype(np.float32)), sitk.GetImageFromArray(b.astype(np.float32))
+    M = sitk.GetImageFromArray(m.astype(np.uint8))
+    R = sitk.ImageRegistrationMethod()
+    R.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    R.SetMetricFixedMask(M)
+    R.SetMetricSamplingStrategy(R.RANDOM)
+    R.SetMetricSamplingPercentage(0.2, 42)
+    R.SetInterpolator(sitk.sitkLinear)
+    R.SetInitialTransform(sitk.TranslationTransform(3), inPlace=False)
+    return float(R.MetricEvaluate(A, B))
+
+def md5(path):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _stage3(args):
+    sid, s1_root, final_root, n_threads = args
+    s1, dst = Path(s1_root) / sid, Path(final_root) / f'{sid}.npz'
+    qfile = Path(final_root) / f'{sid}_qc.json'
+    if dst.exists() and qfile.exists():
+        return sid, True, 'cache', json.load(open(qfile))
+    try:
+        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(n_threads)
+        fl = sitk.ReadImage(str(s1 / 'flair.nii.gz'), sitk.sitkFloat32)
+        t1 = sitk.ReadImage(str(s1 / 't1_reg.nii.gz'), sitk.sitkFloat32)
+        mk = sitk.ReadImage(str(s1 / 'brainmask.nii.gz'), sitk.sitkUInt8)
+        mk.CopyInformation(fl)
+        m = sitk.GetArrayFromImage(mk) > 0
+        flz, t1z = znorm(n4_correct(fl, mk), m), znorm(n4_correct(t1, mk), m)
+        roi = (sitk.GetArrayFromImage(sitk.ReadImage(str(s1 / 'roi.nii.gz'))) > 0) if (s1 / 'roi.nii.gz').exists() \
+              else np.zeros_like(m)
+        idx = np.argwhere(m)
+        lo = np.maximum(idx.min(0) - 4, 0); hi = np.minimum(idx.max(0) + 5, m.shape)
+        sl = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+        mc = m[sl]
+        q = {'brain_ml': float(m.sum() * np.prod(SPACING) / 1000),
+             'roi_dans_cerveau': float(np.logical_and(roi, m).sum() / roi.sum()) if roi.sum() else None,
+             'mi_final': mi_in_mask(flz[sl], t1z[sl], mc),
+             'inhom_t1': inhomogeneity(t1z[sl], mc),
+             'inhom_flair': inhomogeneity(flz[sl], mc),
+             'forme_recadree': 'x'.join(map(str, mc.shape))}
+        np.savez_compressed(dst, flair=flz[sl].astype(np.float16), t1=t1z[sl].astype(np.float16),
+                            mask=mc.astype(np.uint8), roi=roi[sl].astype(np.uint8),
+                            bbox=np.stack([lo, hi]), spacing=np.array(SPACING))
+        q['md5'] = md5(dst)
+        with open(qfile, 'w') as f:
+            json.dump(q, f)
+        return sid, True, None, q
+    except Exception as e:
+        return sid, False, f'{type(e).__name__}: {e}', None
+print('Étape 3 prête')
+Étape 3 prête
+# Cell 9 — Exécution parallèle de l'étape 3
+ready = [sid for sid in inv.participant_id if (STAGE1 / sid / 'brainmask.nii.gz').exists()]
+tasks = [(sid, str(STAGE1), str(FINAL), max(1, N_CPU // N_WORKERS)) for sid in ready]
+qc3, fails3 = {}, []
+t0 = time.time()
+with ProcessPoolExecutor(max_workers=N_WORKERS) as ex:
+    futs = [ex.submit(_stage3, t) for t in tasks]
+    for i, fu in enumerate(as_completed(futs), 1):
+        sid, ok, msg, q = fu.result()
+        if not ok: fails3.append((sid, msg)); print('  échec', sid, msg)
+        if q: qc3[sid] = q
+        if i % 20 == 0:
+            print(f'  {i}/{len(tasks)}  ({(time.time()-t0)/60:.1f} min)')
+print(f'Étape 3 : {len(tasks) - len(fails3)} OK, {len(fails3)} échecs, {(time.time()-t0)/60:.1f} min')
+  20/170  (71.4 min)
+  40/170  (145.1 min)
+  60/170  (220.1 min)
+  80/170  (290.3 min)
+  100/170  (360.7 min)
+  120/170  (435.5 min)
+  140/170  (510.0 min)
+  160/170  (584.7 min)
+Étape 3 : 170 OK, 0 échecs, 615.5 min
+Étape 4 — Contrôle qualité
+Alertes (à vérifier visuellement) :
+
+lesion_coupee : moins de 90 % de la ROI dans le masque cérébral.
+alignement : mi_final nettement moins bon que la cohorte (seuil robuste médiane + 3 MAD). Calculée après N4 et dans le cerveau, elle n'est plus faussée par le champ de biais.
+inhom_t1, inhom_flair : inhomogénéité résiduelle nettement supérieure à la cohorte.
+masque_cerveau : volume cérébral hors de [700, 2200] mL.
+roi_resample : volume de la ROI modifié de plus de 20 % par le rééchantillonnage.
+Information (pas une erreur) : deplacement > 20 mm signifie que la tête a bougé entre les deux séquences ; le recalage l'a corrigé.
+
+# Cell 10 — Table de contrôle qualité
+recs = []
+for sid in inv.participant_id:
+    rec = {'participant_id': sid}
+    rj = STAGE1 / sid / 'reg.json'
+    if rj.exists(): rec.update(json.load(open(rj)))
+    qj = FINAL / f'{sid}_qc.json'
+    if qj.exists(): rec.update(json.load(open(qj)))
+    rec['final_ok'] = (FINAL / f'{sid}.npz').exists()
+    recs.append(rec)
+qc = pd.DataFrame(recs).merge(inv[['participant_id', 'group', 'split', 'mri_diagnosis', 'age_scan']], on='participant_id')
+qc['roi_dans_cerveau'] = pd.to_numeric(qc['roi_dans_cerveau'], errors='coerce')
+
+def robust_high(s):
+    return s.median() + 3 * (s - s.median()).abs().median()
+
+qc['alerte'] = ''
+qc.loc[qc.roi_dans_cerveau < 0.9, 'alerte'] += 'lesion_coupee '
+qc.loc[qc.mi_final > robust_high(qc.mi_final), 'alerte'] += 'alignement '     # MI Mattes : plus haut = moins bon
+for col in ['inhom_t1', 'inhom_flair']:
+    qc.loc[qc[col] > robust_high(qc[col]), 'alerte'] += f'{col} '
+qc.loc[(qc.brain_ml < 700) | (qc.brain_ml > 2200), 'alerte'] += 'masque_cerveau '
+qc.loc[(qc.roi_volume_ratio < 0.8) | (qc.roi_volume_ratio > 1.25), 'alerte'] += 'roi_resample '
+qc['alerte'] = qc.alerte.str.strip()
+qc['mouvement'] = qc.deplacement_centre_mm > 20
+qc.to_csv(FINAL / 'preproc_table.csv', index=False)
+
+print('Sujets finalisés :', int(qc.final_ok.sum()), '/', len(qc))
+print('Patients avec lésion dans le npz :', int((qc.group.eq('fcd') & qc.roi_dans_cerveau.notna()).sum()), '/ 85')
+cols = ['mi_avant', 'mi_apres', 'mi_final', 'deplacement_centre_mm', 'brain_ml', 'roi_dans_cerveau', 'inhom_t1', 'inhom_flair']
+print(qc[cols].describe().round(3).to_string())
+print('\nSujets en alerte :')
+print(qc.loc[qc.alerte != '', ['participant_id', 'group', 'age_scan', 'alerte', 'mi_final', 'inhom_t1',
+                               'inhom_flair', 'deplacement_centre_mm']].round(3).to_string(index=False) or 'aucun')
+print('\nSujets ayant bougé (> 20 mm, information) :', qc.loc[qc['mouvement'], 'participant_id'].tolist())
+Sujets finalisés : 170 / 170
+Patients avec lésion dans le npz : 85 / 85
+       mi_avant  mi_apres  mi_final  deplacement_centre_mm  brain_ml  roi_dans_cerveau  inhom_t1  inhom_flair
+count   170.000   170.000   170.000                170.000   170.000            85.000   170.000      170.000
+mean     -0.529    -0.609    -0.325                  2.192  1431.689             1.000     0.127        0.133
+std       0.092     0.064     0.067                  4.226   144.918             0.001     0.019        0.026
+min      -0.714    -0.744    -0.488                  0.066  1096.132             0.995     0.090        0.073
+25%      -0.595    -0.661    -0.368                  0.536  1323.263             1.000     0.114        0.114
+50%      -0.538    -0.613    -0.324                  0.828  1419.006             1.000     0.122        0.127
+75%      -0.489    -0.559    -0.286                  1.431  1542.854             1.000     0.136        0.148
+max      -0.181    -0.447    -0.121                 31.251  1793.581             1.000     0.208        0.223
+
+Sujets en alerte :
+participant_id group  age_scan               alerte  mi_final  inhom_t1  inhom_flair  deplacement_centre_mm
+     sub-00120   fcd         8           alignement    -0.121     0.116        0.170                  4.426
+     sub-00050   fcd         9             inhom_t1    -0.350     0.159        0.172                  1.197
+     sub-00066   fcd         8 inhom_t1 inhom_flair    -0.284     0.157        0.212                 18.488
+     sub-00090   fcd         5          inhom_flair    -0.335     0.115        0.175                  0.198
+     sub-00040   fcd         6          inhom_flair    -0.326     0.144        0.182                  0.868
+     sub-00078   fcd         9          inhom_flair    -0.212     0.137        0.181                 14.680
+     sub-00032   fcd        12 inhom_t1 inhom_flair    -0.265     0.208        0.223                  0.299
+     sub-00089   fcd        11          inhom_flair    -0.320     0.149        0.181                  3.835
+     sub-00130   fcd         3           alignement    -0.139     0.124        0.168                  0.513
+     sub-00016   fcd         6          inhom_flair    -0.304     0.137        0.177                  0.736
+     sub-00018   fcd         8           alignement    -0.182     0.119        0.140                  0.247
+     sub-00015   fcd         6           alignement    -0.127     0.110        0.076                  3.715
+     sub-00134   fcd         7 inhom_t1 inhom_flair    -0.488     0.163        0.189                  0.148
+     sub-00112   fcd        10 inhom_t1 inhom_flair    -0.273     0.157        0.181                  0.422
+     sub-00020   fcd         3          inhom_flair    -0.315     0.133        0.177                  0.732
+     sub-00053   fcd         4           alignement    -0.156     0.099        0.146                  1.243
+     sub-00105   fcd        11 inhom_t1 inhom_flair    -0.369     0.163        0.205                  2.364
+     sub-00074   fcd         4           alignement    -0.164     0.107        0.168                  0.853
+     sub-00065   fcd         5             inhom_t1    -0.340     0.179        0.157                  0.656
+     sub-00081   fcd         5 inhom_t1 inhom_flair    -0.450     0.204        0.193                  1.608
+     sub-00126   fcd        12             inhom_t1    -0.423     0.157        0.168                  0.542
+     sub-00023    hc        10             inhom_t1    -0.411     0.166        0.154                  1.211
+     sub-00026    hc        13             inhom_t1    -0.308     0.162        0.148                  1.016
+     sub-00030    hc        11             inhom_t1    -0.448     0.157        0.143                  1.075
+     sub-00067    hc         7             inhom_t1    -0.300     0.174        0.139                  0.515
+     sub-00069    hc        11             inhom_t1    -0.422     0.170        0.156                  1.212
+     sub-00082    hc         5             inhom_t1    -0.353     0.169        0.143                  9.995
+     sub-00119    hc         5             inhom_t1    -0.311     0.157        0.124                  0.637
+
+Sujets ayant bougé (> 20 mm, information) : ['sub-00043', 'sub-00006', 'sub-00167']
+# Cell 11 — Distributions des indicateurs (seuils en pointillés)
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, col in zip(axes, ['mi_final', 'inhom_t1', 'inhom_flair']):
+    for g, c in [('hc', 'tab:blue'), ('fcd', 'tab:orange')]:
+        ax.hist(qc.loc[qc.group == g, col].dropna(), bins=30, alpha=0.6, color=c, label=g)
+    ax.axvline(robust_high(qc[col]), color='k', ls='--', label='seuil')
+    ax.set_title(col); ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig(FINAL / 'fig_qc_distributions.png', dpi=110, bbox_inches='tight'); plt.show()
+
+# Cell 12 — QC visuel : FLAIR (cerveau jaune, lésion rouge) | T1 recalé + contours FLAIR | biais résiduel du T1
+FORCED = ['sub-00149', 'sub-00073', 'sub-00112', 'sub-00167', 'sub-00043', 'sub-00006']
+show = [s for s in FORCED if s in set(qc.participant_id)]
+show += [s for s in qc.loc[qc.mri_diagnosis == 'none', 'participant_id'] if s not in show]
+show += [s for s in qc.loc[qc.alerte != '', 'participant_id'] if s not in show]
+rest = [s for s in qc.loc[qc.final_ok, 'participant_id'] if s not in show]
+rng = np.random.RandomState(0)
+show += list(rng.choice(rest, size=min(len(rest), max(0, 16 - len(show))), replace=False))
+show = [s for s in show if (FINAL / f'{s}.npz').exists()][:22]
+
+qi = qc.set_index('participant_id')
+fig, axes = plt.subplots(len(show), 3, figsize=(12, 4 * len(show)))
+axes = np.atleast_2d(axes)
+for k, sid in enumerate(show):
+    z = np.load(FINAL / f'{sid}.npz')
+    fl, t1, m, roi = z['flair'].astype(np.float32), z['t1'].astype(np.float32), z['mask'] > 0, z['roi'] > 0
+    s = int(np.argmax(roi.sum((1, 2)))) if roi.any() else fl.shape[0] // 2
+    edges = np.abs(ndimage.sobel(ndimage.gaussian_filter(fl[s], 1.0)))
+    axes[k, 0].imshow(fl[s], cmap='gray', origin='lower', vmin=-3, vmax=3)
+    axes[k, 0].contour(m[s], levels=[0.5], colors='yellow', linewidths=0.8)
+    if roi[s].any(): axes[k, 0].contour(roi[s], levels=[0.5], colors='red', linewidths=1.2)
+    axes[k, 1].imshow(t1[s], cmap='gray', origin='lower', vmin=-3, vmax=3)
+    axes[k, 1].contour(edges, levels=[np.percentile(edges, 97)], colors='cyan', linewidths=0.4)
+    bias = np.where(m[s], smooth_in_mask(t1, m)[s], np.nan)
+    im = axes[k, 2].imshow(bias, cmap='coolwarm', origin='lower', vmin=-1, vmax=1)
+    a = qi.loc[sid]
+    axes[k, 0].set_title(f"{sid} ({a.group}, {a.mri_diagnosis}) {a.alerte}", fontsize=9)
+    axes[k, 1].set_title(f"T1 recalé + contours FLAIR (MI={a.mi_final:.2f})", fontsize=9)
+    axes[k, 2].set_title(f"Biais résiduel T1 (inhom={a.inhom_t1:.2f})", fontsize=9)
+    for ax in axes[k]: ax.axis('off')
+plt.tight_layout(); plt.savefig(FINAL / 'fig_qc_preproc.png', dpi=100, bbox_inches='tight'); plt.show()
+
+Sauvegarde
+Seul ds004199_preproc/final/ est nécessaire pour la suite (.npz, *_qc.json, preproc_table.csv, figures). Sauvegarde-le depuis la sortie de ce notebook (Output → New Dataset, nom suggéré ds004199-preproc) plutôt que par un upload manuel. La colonne md5 de preproc_table.csv permettra au prochain notebook de vérifier qu'aucun fichier n'a été altéré en route.
+
+# Cell 13 — Résumé (+ suppression optionnelle des intermédiaires)
+DELETE_INTERMEDIATES = True   # supprime stage1/ et le téléchargement brut pour alléger la sortie
+done = sorted(p.stem for p in FINAL.glob('sub-*.npz'))
+print(f'{len(done)} sujets prétraités sur {len(inv)}')
+print(qc[qc.final_ok].groupby(['group', 'split']).size().to_string())
+print('Sujets en alerte :', int((qc.alerte != '').sum()))
+if DELETE_INTERMEDIATES:
+    shutil.rmtree(STAGE1, ignore_errors=True); shutil.rmtree(FULL, ignore_errors=True)
+    print('stage1/ et ds004199_full/ supprimés')
+size_gb = sum(p.stat().st_size for p in FINAL.glob('*')) / 1e9
+print(f'Taille de final/ : {size_gb:.2f} Go | durée totale : {(time.time()-T0)/60:.1f} min')
+170 sujets prétraités sur 170
+group  split
+fcd    test     28
+       train    57
+hc     train    85
+Sujets en alerte : 28
+stage1/ et ds004199_full/ supprimés
+Taille de final/ : 0.92 Go | durée totale : 683.6 min

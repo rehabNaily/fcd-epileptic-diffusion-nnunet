@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below."
+title: "fcd-epileptic-diffusion-nnunet: diffusion-model anomaly maps as input priors for nnU-Net segmentation of focal cortical dysplasia"
+authors:
+  - family-names: Naily
+    given-names: Rehab
+    affiliation: "RTIM, National Engineering School of Gabès (ENIG), University of Gabès, Tunisia"
+  - family-names: Zaied
+    given-names: Mourad
+    affiliation: "RTIM, National Engineering School of Gabès (ENIG), University of Gabès, Tunisia"
+license: MIT
+repository-code: "https://github.com/rehabNaily/fcd-epileptic-diffusion-nnunet"
+version: "1.0.0"
+date-released: 2026-11-22

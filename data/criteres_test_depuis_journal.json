@@ -1,0 +1,14 @@
+{
+ "source": "Kaggle log of notebook 'nnU-Net hybride (étape B)', Cell 7bis (file criteres_preenregistres.json not re-downloaded)",
+ "question": "La carte d'anomalie générative (posF_6_norm), ajoutée comme 3e canal, améliore-t-elle nnU-Net ?",
+ "critere_principal": "Dice moyen par patient sur le test officiel (fcdA_test + fcdB_test, n = 27), différence appariée hybride - baseline, test de Wilcoxon bilatéral, alpha = 0,05",
+ "criteres_secondaires": [
+  "taux de détection (au moins un cluster prédit touchant la lésion)",
+  "nombre de clusters faux positifs par patient",
+  "AUPRC au voxel dans le cerveau",
+  "résultats séparés par protocole (A / B) et pour les IRM-négatifs (analyse exploratoire)"
+ ],
+ "modeles": "nnU-Net 3d_fullres, 100 époques, fold 0 (même découpage), checkpoint_final",
+ "decision": "Aucun réglage ne sera modifié après l'ouverture du test.",
+ "horodatage": "2026-10-25 17:50:23"
+}

@@ -1,0 +1,8 @@
+# analysis and figures (scripts/)
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+statsmodels>=0.14
+matplotlib>=3.8
+pillow>=10.0
+# Kaggle notebooks additionally used: nnunetv2==2.8.1, torch, SimpleITK, nibabel, hd-bet, scikit-learn

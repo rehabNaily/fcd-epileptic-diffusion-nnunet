@@ -1,0 +1,19 @@
+{
+ "source": "logs/etapeC_test_final_2026-11-04/journal_test_final.txt (lines 109-136, 139-144)",
+ "fp_diff": -0.0370, "fp_lo": -0.2593, "fp_hi": 0.1852, "fp_p": 0.763, "fp_mean_b": 0.481, "fp_mean_h": 0.444,
+ "auprc_holm": 0.973, "fp_holm": 0.973,
+ "mri_negative": [
+  {"id": "sub-00062", "protocole": "A", "dice_b": 0.000, "dice_h": 0.001},
+  {"id": "sub-00100", "protocole": "A", "dice_b": 0.000, "dice_h": 0.000},
+  {"id": "sub-00066", "protocole": "B", "dice_b": 0.073, "dice_h": 0.312},
+  {"id": "sub-00107", "protocole": "B", "dice_b": 0.000, "dice_h": 0.000}],
+ "validation_fold0_before_test_criteria": {"diff": -0.0640, "lo": -0.1647, "hi": 0.0164, "p": 0.461, "better": "3/10"},
+ "repredict_agreement": {"baseline": 1.0000, "hybride": 0.9999},
+ "sha256": {
+  "criteres_preenregistres.json": "7eec1d9f0ae5efacdeb564da094f83f77a6d03baeced154ccf5f6285452bdf7a",
+  "baseline/checkpoint_final.pth": "1cb97cec3fa5490a2048ef5142f7a1d4f5612ea5759b6a3d4d66a58366a426da",
+  "hybride/checkpoint_final.pth": "0441649f1d17f71012f73ab7e1a8b5979c61abfd086d8dc167ad89eb77158599"},
+ "failed_attempt": "2026-10-28 13:14:40 (trainer not installed; no prediction or metric produced)",
+ "test_opened": "2026-11-04 16:08:10",
+ "cv_comparison_run": "2026-11-17 02:51:30"
+}

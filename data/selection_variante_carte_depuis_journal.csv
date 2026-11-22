@@ -1,0 +1,6 @@
+variant,auprc_mean_fcdA_val,auprc_median_fcdA_val,auroc_mean_fcdA_val,top1_hit,top3_hit,clusters_healthy,synth_auprc_1p5sd,synth_auprc_3sd
+abs_FT_2,0.0069,0.0021,0.6302,0.0,0.08,12.6,0.033,0.611
+abs_FT_6,0.0095,0.0022,0.6294,0.04,0.04,11.4,0.207,0.759
+posF_2,0.0127,0.004,0.6787,0.12,0.16,19.6,0.728,0.939
+posF_6,0.0184,0.0047,0.6645,0.16,0.2,19.7333,0.815,0.947
+posF_6_norm,0.0222,0.0059,0.6687,0.16,0.24,17.6667,0.796,0.931

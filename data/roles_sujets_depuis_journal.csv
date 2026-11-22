@@ -1,0 +1,9 @@
+role,n
+hc_train,63
+fcdA_val,25
+fcdB_val,25
+fcdA_test,16
+hc_calibration,15
+fcdB_test,11
+exclu_autre_protocole,8
+controle_t1_sag111,7

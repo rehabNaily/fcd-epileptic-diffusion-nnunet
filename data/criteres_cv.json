@@ -1,0 +1,20 @@
+{
+ "question": "Sur une validation croisée à 5 folds des 50 patients d'entraînement, la carte d'anomalie ajoutée comme 3e canal améliore-t-elle nnU-Net, et son effet dépend-il de la qualité de la carte ?",
+ "critere_principal": "Dice par patient sur les prédictions hors-fold (n = 50, chaque patient prédit par le modèle qui ne l'a pas vu), différence appariée hybride - baseline, Wilcoxon bilatéral, alpha = 0,05",
+ "hypothese_mecanisme": "H2 : la différence de Dice hybride - baseline hors-fold est positivement corrélée à l'AUPRC de la carte seule (Spearman bilatéral, n = 50, alpha = 0,05)",
+ "criteres_secondaires": [
+  "détection (McNemar exact)",
+  "clusters faux positifs par patient",
+  "AUPRC au voxel",
+  "variabilité entre folds (différence moyenne par fold)",
+  "dépendance à la carte : hybride avec carte nulle, par fold"
+ ],
+ "exploratoire": [
+  "résultats par protocole",
+  "IRM-négatifs",
+  "régression delta ~ qualité de carte + Dice baseline + protocole"
+ ],
+ "modeles": "nnU-Net 3d_fullres, 100 époques, trainer nnUNetTrainer_Kaggle, nnunetv2 2.8.1, checkpoint_final, mêmes folds pour les deux modèles ; fold 0 = modèles déjà entraînés",
+ "transparence": "Le fold 0 (10 patients) a déjà été vu en validation interne et l'étape 1 (exploratoire) a été réalisée sur le test officiel et ces 10 patients avant ces critères ; le test officiel n'est plus utilisé. Aucun réglage ne sera modifié après les premiers résultats de CV.",
+ "horodatage": "2026-11-04 17:30:03"
+}
